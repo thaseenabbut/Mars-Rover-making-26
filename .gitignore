@@ -3,3 +3,8 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+.vscode/extensions.json
+.include/readme.md
+.lib/readme.md
+.test/readme.md
+mars-rover.frimware-spec.md
