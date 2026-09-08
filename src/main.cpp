@@ -2,13 +2,18 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 // ==============================================================================
-// Mars Rover — Single-File Firmware
+// Mars Rover — BLE Manual Control Firmware
 // ==============================================================================
-// All modules (config, Motors, Sensors, Encoders, IMU, Control) merged into one
-// file. Logic, pin definitions, comments, and constants are identical to the
-// multi-file version — only the file boundaries are removed.
+// Manual driving via BLE (Nordic UART Service protocol).
+// The "BLE Controller" app sends single-char commands: F/B/L/R/S.
+// Sensors, encoders, and IMU are read continuously and streamed back over BLE
+// for telemetry, but do NOT drive the motors autonomously.
 // ==============================================================================
 
 
@@ -100,27 +105,28 @@
 #define PWM_RESOLUTION  8      // 8-bit resolution (0-255 duty cycle range)
 
 // ------------------------------------------------------------------------------
-// Control Loop Constants
+// BLE Configuration
 // ------------------------------------------------------------------------------
+#define BLE_DEVICE_NAME     "MarsRover"
 
-// Speed mapping — distance (cm) to duty cycle (0-255)
-#define SPEED_MIN_DISTANCE      15.0f   // Below this = emergency stop
-#define SPEED_MAX_DISTANCE      100.0f  // Above this = max cruising speed
-#define SPEED_MIN_DUTY          40      // Minimum PWM to overcome motor stiction
-#define SPEED_MAX_DUTY          230     // Max cruise (< 255 to leave steering headroom)
+// Nordic UART Service (NUS) UUIDs — standard for UART-over-BLE apps
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHAR_UUID_RX        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // Write (app → ESP32)
+#define CHAR_UUID_TX        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // Notify (ESP32 → app)
 
-// Steering
-#define STEERING_GAIN           0.5f    // How aggressively distance delta affects steering
-#define STEERING_MAX_BIAS       50      // Maximum PWM bias added/subtracted per side
-
-// Smoothing
-#define SPEED_SMOOTHING_FACTOR  0.2f    // 0.0 = no smoothing, 1.0 = instant (recommend 0.1-0.3)
-
-// Control loop timing
-#define CONTROL_LOOP_MS         75      // Target loop period in milliseconds (~13 Hz)
+// ------------------------------------------------------------------------------
+// Manual Drive Constants
+// ------------------------------------------------------------------------------
+#define DRIVE_SPEED_FORWARD   200   // PWM for forward driving
+#define DRIVE_SPEED_REVERSE   180   // PWM for reverse
+#define TURN_SPEED_FORWARD    180   // Forward side during turn
+#define TURN_SPEED_REVERSE    120   // Reverse side during turn (differential)
 
 // Sensor timeout
 #define SENSOR_TIMEOUT_US       30000   // 30ms timeout for HC-SR04 echo (max ~5m range)
+
+// Telemetry interval
+#define TELEMETRY_INTERVAL_MS   500     // Send sensor data every 500ms
 
 // Serial
 #define SERIAL_BAUD             115200  // Serial monitor baud rate
@@ -147,15 +153,6 @@ struct IMUData {
     float gyroZ;
     // Temperature (deg C)
     float temp;
-};
-
-struct ControlState {
-    float currentSpeed;
-    float targetSpeed;
-    float steeringBias;
-    int leftPWM;
-    int rightPWM;
-    SensorDistances distances;
 };
 
 
@@ -308,7 +305,7 @@ void Motors::stop() {
 // ==============================================================================
 // Reads the 3 front-facing distance sensors (Left, Center, Right).
 // Uses `pulseIn` for timing the echo. If an object is out of range,
-// returns a highly positive max value safely so the rover keeps moving.
+// returns a highly positive max value so telemetry shows "clear".
 
 class Sensors {
 public:
@@ -363,7 +360,7 @@ float Sensors::readSensor(uint8_t trigPin, uint8_t echoPin) {
     // 3. Convert to cm: (durationUs / 2) / 29.1
     if (durationUs == 0) {
         // Timeout occurred, assume out of range (far)
-        return SPEED_MAX_DISTANCE + 50.0f;
+        return 400.0f;  // Return high value for telemetry
     }
 
     float distanceCm = (float)durationUs * 0.01716f; // speed of sound ~343m/s = 0.0343cm/us
@@ -375,8 +372,7 @@ float Sensors::readSensor(uint8_t trigPin, uint8_t echoPin) {
 // SECTION: Encoders — Motor Wheel Encoders (Quadrature)
 // ==============================================================================
 // Set up ISRs to count pulses per motor.
-// Closed-loop PID control is deferred per spec; these are just for logging/
-// calibration/potential future use.
+// Used for telemetry/logging only — no closed-loop control yet.
 
 class Encoders {
 public:
@@ -508,8 +504,7 @@ void IRAM_ATTR Encoders::handleRR() {
 // SECTION: IMU — MPU6050 6-DOF Gyroscope & Accelerometer
 // ==============================================================================
 // Reads the accelerometer and gyroscope via I2C.
-// Standalone module for now — data is read and exposed, but not yet fed back
-// into the control loop per spec.
+// Used for telemetry — not yet integrated into motor control.
 
 class IMU {
 public:
@@ -583,172 +578,82 @@ bool IMU::isConnected() {
 
 
 // ==============================================================================
-// SECTION: Control — Obstacle Avoidance & Steering Controller
+// SECTION: BLE Server — Nordic UART Service (NUS)
 // ==============================================================================
-// Implements continuous, smooth obstacle avoidance:
-// 1. Reads 3 distance sensors
-// 2. Maps center distance to target speed (linear ramp with min/max cutoffs)
-// 3. Calculates steering bias from left-right difference
-// 4. Smooths current speed toward target speed via exponential filter
-// 5. Outputs differential drive PWM to left and right motor banks
+// Receives single-char commands from "BLE Controller" app, sends telemetry back.
 
-class Control {
-public:
-    Control(Motors& motors, Sensors& sensors, Encoders& encoders, IMU& imu);
+BLEServer* bleServer = nullptr;
+BLECharacteristic* txCharacteristic = nullptr;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
 
-    // Call once during setup()
-    void begin();
+// Forward declarations
+void handleBLECommand(char cmd);
+void sendBLETelemetry(const char* message);
 
-    // Call every loop cycle — automatically respects CONTROL_LOOP_MS
-    void update();
+class ServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+        Serial.println("[BLE] Client connected");
+    }
 
-    // Read internal state for debugging/telemetry
-    ControlState getState() const;
-
-private:
-    Motors& motors;
-    Sensors& sensors;
-    Encoders& encoders;
-    IMU& imu;
-
-    float currentSpeed;
-    unsigned long lastUpdateTime;
-    ControlState lastState;
-
-    // Helper: compute target speed from center distance
-    float computeTargetSpeed(float centerDistance);
-
-    // Helper: compute steering bias from left and right distances
-    float computeSteeringBias(float leftDistance, float rightDistance);
+    void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+        Serial.println("[BLE] Client disconnected");
+    }
 };
 
-Control::Control(Motors& m, Sensors& s, Encoders& e, IMU& i)
-    : motors(m), sensors(s), encoders(e), imu(i), currentSpeed(0.0f), lastUpdateTime(0) {
-    memset(&lastState, 0, sizeof(lastState));
+// Callback for receiving commands from the app
+class RxCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+        if (value.length() > 0) {
+            char cmd = value[0];
+            handleBLECommand(cmd);
+        }
+    }
+};
+
+void setupBLE() {
+    BLEDevice::init(BLE_DEVICE_NAME);
+    bleServer = BLEDevice::createServer();
+    bleServer->setCallbacks(new ServerCallbacks());
+
+    // Create the Nordic UART Service
+    BLEService* service = bleServer->createService(SERVICE_UUID);
+
+    // TX Characteristic (ESP32 → App) — notify only
+    txCharacteristic = service->createCharacteristic(
+        CHAR_UUID_TX,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    txCharacteristic->addDescriptor(new BLE2902());
+
+    // RX Characteristic (App → ESP32) — write only
+    BLECharacteristic* rxCharacteristic = service->createCharacteristic(
+        CHAR_UUID_RX,
+        BLECharacteristic::PROPERTY_WRITE
+    );
+    rxCharacteristic->setCallbacks(new RxCallbacks());
+
+    service->start();
+
+    // Start advertising
+    BLEAdvertising* advertising = BLEDevice::getAdvertising();
+    advertising->addServiceUUID(SERVICE_UUID);
+    advertising->setScanResponse(true);
+    advertising->setMinPreferred(0x06);  // functions that help with iPhone connections
+    advertising->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+
+    Serial.println("[BLE] Server started, advertising as: " BLE_DEVICE_NAME);
 }
 
-void Control::begin() {
-    currentSpeed = 0.0f;
-    lastUpdateTime = millis();
-}
-
-void Control::update() {
-    unsigned long now = millis();
-    // Non-blocking rate limiter: only run control logic every CONTROL_LOOP_MS
-    if (now - lastUpdateTime < CONTROL_LOOP_MS) {
-        return;
+void sendBLETelemetry(const char* message) {
+    if (deviceConnected && txCharacteristic != nullptr) {
+        txCharacteristic->setValue((uint8_t*)message, strlen(message));
+        txCharacteristic->notify();
     }
-    lastUpdateTime = now;
-
-    // --------------------------------------------------------------------------
-    // 1. Read Sensors
-    // --------------------------------------------------------------------------
-    SensorDistances dists = sensors.readAll();
-
-    // --------------------------------------------------------------------------
-    // 2. Compute Target Speed from Center Sensor
-    // --------------------------------------------------------------------------
-    float targetSpeed = computeTargetSpeed(dists.center);
-
-    // --------------------------------------------------------------------------
-    // 3. Compute Steering Bias from Left vs Right
-    // --------------------------------------------------------------------------
-    // Positive bias = steer right (more left speed, less right speed)
-    // Negative bias = steer left (less left speed, more right speed)
-    float steeringBias = computeSteeringBias(dists.left, dists.right);
-
-    // --------------------------------------------------------------------------
-    // 4. Smooth Speed Changes (Exponential Filter)
-    // --------------------------------------------------------------------------
-    // If target speed is 0 (hard stop / obstacle close), stop immediately for safety!
-    if (targetSpeed <= 0.0f) {
-        currentSpeed = 0.0f;
-    } else {
-        currentSpeed += (targetSpeed - currentSpeed) * SPEED_SMOOTHING_FACTOR;
-    }
-
-    // --------------------------------------------------------------------------
-    // 5. Compute Differential Wheel Speeds
-    // --------------------------------------------------------------------------
-    int leftPWM = 0;
-    int rightPWM = 0;
-
-    if (currentSpeed > 0.0f) {
-        leftPWM  = (int)(currentSpeed + steeringBias);
-        rightPWM = (int)(currentSpeed - steeringBias);
-
-        // Clamp to valid 8-bit PWM bounds [0, 255]
-        if (leftPWM > 255) leftPWM = 255;
-        if (leftPWM < 0)   leftPWM = 0;
-        if (rightPWM > 255) rightPWM = 255;
-        if (rightPWM < 0)   rightPWM = 0;
-    }
-
-    // --------------------------------------------------------------------------
-    // 6. FUTURE EXTENSION HOOK: Closed-Loop PID Speed Control
-    // --------------------------------------------------------------------------
-    // In future iterations:
-    // long encoderCounts[6];
-    // encoders.getCounts(encoderCounts);
-    // Calculate current left/right RPM and feed into a PID controller to adjust
-    // leftPWM and rightPWM to match desired target RPM precisely on rough terrain.
-    // --------------------------------------------------------------------------
-
-    // --------------------------------------------------------------------------
-    // 7. FUTURE EXTENSION HOOK: IMU Tilt / Stability Guard
-    // --------------------------------------------------------------------------
-    // In future iterations:
-    // IMUData imuData = imu.read();
-    // If pitch or roll exceeds safety angle (e.g. rover is tipping over on a rock),
-    // override motors to emergency stop.
-    // --------------------------------------------------------------------------
-
-    // --------------------------------------------------------------------------
-    // 8. Apply Motor Output
-    // --------------------------------------------------------------------------
-    motors.setSpeed(leftPWM, rightPWM);
-
-    // Save state for debug logs
-    lastState.currentSpeed = currentSpeed;
-    lastState.targetSpeed  = targetSpeed;
-    lastState.steeringBias = steeringBias;
-    lastState.leftPWM      = leftPWM;
-    lastState.rightPWM     = rightPWM;
-    lastState.distances    = dists;
-}
-
-float Control::computeTargetSpeed(float centerDistance) {
-    // Hard safety stop
-    if (centerDistance <= SPEED_MIN_DISTANCE) {
-        return 0.0f;
-    }
-
-    // Full speed ahead
-    if (centerDistance >= SPEED_MAX_DISTANCE) {
-        return (float)SPEED_MAX_DUTY;
-    }
-
-    // Linear ramp between min and max distance
-    float ratio = (centerDistance - SPEED_MIN_DISTANCE) / (SPEED_MAX_DISTANCE - SPEED_MIN_DISTANCE);
-    return SPEED_MIN_DUTY + ratio * (SPEED_MAX_DUTY - SPEED_MIN_DUTY);
-}
-
-float Control::computeSteeringBias(float leftDistance, float rightDistance) {
-    // Delta = Right - Left
-    // If obstacle is on the left -> rightDistance is larger -> positive bias -> steer right
-    // If obstacle is on the right -> leftDistance is larger -> negative bias -> steer left
-    float delta = rightDistance - leftDistance;
-    float bias = delta * STEERING_GAIN;
-
-    // Clamp bias to maximum allowed offset
-    if (bias > STEERING_MAX_BIAS)  bias = STEERING_MAX_BIAS;
-    if (bias < -STEERING_MAX_BIAS) bias = -STEERING_MAX_BIAS;
-
-    return bias;
-}
-
-ControlState Control::getState() const {
-    return lastState;
 }
 
 
@@ -759,11 +664,56 @@ Motors   motors;
 Sensors  sensors;
 Encoders encoders;
 IMU      imu;
-Control  control(motors, sensors, encoders, imu);
 
-// Telemetry timer (print every 500ms so Serial output stays readable)
+// Telemetry timer
 unsigned long lastTelemetryTime = 0;
-const unsigned long TELEMETRY_INTERVAL_MS = 500;
+
+
+// ==============================================================================
+// SECTION: BLE Command Handler
+// ==============================================================================
+// Maps single-char commands to Motors::setSpeed() calls
+
+void handleBLECommand(char cmd) {
+    Serial.printf("[BLE] Received command: %c\n", cmd);
+
+    switch (cmd) {
+        case 'F':  // Forward
+        case 'f':
+            motors.setSpeed(DRIVE_SPEED_FORWARD, DRIVE_SPEED_FORWARD);
+            sendBLETelemetry("CMD: Forward\n");
+            break;
+
+        case 'B':  // Backward
+        case 'b':
+            motors.setSpeed(-DRIVE_SPEED_REVERSE, -DRIVE_SPEED_REVERSE);
+            sendBLETelemetry("CMD: Backward\n");
+            break;
+
+        case 'L':  // Left (differential turn: left reverse, right forward)
+        case 'l':
+            motors.setSpeed(-TURN_SPEED_REVERSE, TURN_SPEED_FORWARD);
+            sendBLETelemetry("CMD: Left\n");
+            break;
+
+        case 'R':  // Right (differential turn: left forward, right reverse)
+        case 'r':
+            motors.setSpeed(TURN_SPEED_FORWARD, -TURN_SPEED_REVERSE);
+            sendBLETelemetry("CMD: Right\n");
+            break;
+
+        case 'S':  // Stop
+        case 's':
+            motors.stop();
+            sendBLETelemetry("CMD: Stop\n");
+            break;
+
+        default:
+            Serial.printf("[BLE] Unknown command: %c\n", cmd);
+            sendBLETelemetry("CMD: Unknown\n");
+            break;
+    }
+}
 
 
 // ==============================================================================
@@ -775,7 +725,7 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(1000); // Allow USB-Serial to settle
     Serial.println("\n=================================");
-    Serial.println("  MARS ROVER FIRMWARE BOOTING... ");
+    Serial.println("  MARS ROVER — BLE MANUAL MODE   ");
     Serial.println("=================================");
 
     // 2. Initialize Motors
@@ -801,52 +751,65 @@ void setup() {
         Serial.println("FAILED (check 3.3V/SDA/SCL wiring or I2C address)");
     }
 
-    // 6. Initialize Main Control Loop
-    Serial.print("[BOOT] Initializing Controller... ");
-    control.begin();
+    // 6. Initialize BLE Server
+    Serial.print("[BOOT] Initializing BLE... ");
+    setupBLE();
     Serial.println("OK");
 
-    Serial.println("[BOOT] Rover Ready! Starting Control Loop...\n");
+    Serial.println("[BOOT] Rover Ready! Waiting for BLE connection...\n");
 }
 
 void loop() {
-    // 1. Run main control loop (handles rate limiting internally)
-    control.update();
+    // Handle BLE connection state changes
+    if (!deviceConnected && oldDeviceConnected) {
+        // Disconnected — stop motors for safety, restart advertising
+        motors.stop();
+        delay(500);
+        bleServer->startAdvertising();
+        Serial.println("[BLE] Restarting advertising...");
+        oldDeviceConnected = deviceConnected;
+    }
 
-    // 2. Periodic Telemetry over Serial
+    if (deviceConnected && !oldDeviceConnected) {
+        // Just connected
+        oldDeviceConnected = deviceConnected;
+    }
+
+    // Periodic Telemetry — send sensor data over BLE
     unsigned long now = millis();
     if (now - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
         lastTelemetryTime = now;
 
-        ControlState state = control.getState();
+        // Read all sensors
+        SensorDistances dists = sensors.readAll();
 
-        // Print Sensor Distances
-        Serial.printf("[DIST] L: %5.1f cm | C: %5.1f cm | R: %5.1f cm\n",
-                      state.distances.left, state.distances.center, state.distances.right);
-
-        // Print Control Status
-        Serial.printf("[CTRL] TargetSpd: %5.1f | CurrSpd: %5.1f | Bias: %5.1f\n",
-                      state.targetSpeed, state.currentSpeed, state.steeringBias);
-
-        // Print Motor Outputs
-        Serial.printf("[MTRS] Left PWM: %3d | Right PWM: %3d\n",
-                      state.leftPWM, state.rightPWM);
-
-        // Read standalone IMU data
-        if (imu.isConnected()) {
-            IMUData imuData = imu.read();
-            Serial.printf("[IMU ] Accel: (%4.1f, %4.1f, %4.1f) m/s^2 | Gyro: (%4.2f, %4.2f, %4.2f) rad/s\n",
-                          imuData.accelX, imuData.accelY, imuData.accelZ,
-                          imuData.gyroX, imuData.gyroY, imuData.gyroZ);
-        }
-
-        // Read standalone Encoder counts
+        // Read encoders
         long encCounts[6];
         encoders.getCounts(encCounts);
-        Serial.printf("[ENCS] FL:%ld FR:%ld ML:%ld MR:%ld RL:%ld RR:%ld\n",
-                      encCounts[0], encCounts[1], encCounts[2],
-                      encCounts[3], encCounts[4], encCounts[5]);
 
-        Serial.println("-------------------------------------------------------------------");
+        // Build telemetry string
+        char telemetry[256];
+        snprintf(telemetry, sizeof(telemetry),
+                 "DIST L:%.0f C:%.0f R:%.0f | ENC FL:%ld FR:%ld\n",
+                 dists.left, dists.center, dists.right,
+                 encCounts[0], encCounts[1]);
+
+        // Send over BLE
+        sendBLETelemetry(telemetry);
+
+        // Also print to Serial for debugging
+        Serial.print(telemetry);
+
+        // Optionally send IMU data if connected
+        if (imu.isConnected()) {
+            IMUData imuData = imu.read();
+            char imuTelemetry[128];
+            snprintf(imuTelemetry, sizeof(imuTelemetry),
+                     "IMU Acc:(%.1f,%.1f,%.1f) Gyro:(%.2f,%.2f,%.2f)\n",
+                     imuData.accelX, imuData.accelY, imuData.accelZ,
+                     imuData.gyroX, imuData.gyroY, imuData.gyroZ);
+            sendBLETelemetry(imuTelemetry);
+            Serial.print(imuTelemetry);
+        }
     }
 }
